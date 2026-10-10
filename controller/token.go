@@ -475,6 +475,9 @@ func issueProvisionedToken(c *gin.Context, target *model.User, req provisionUser
 }
 
 func provisionResponse(token *model.Token, target *model.User, planId int, planTitle, planMessage string) gin.H {
+	// Returns the shared provision payload: user_id, username, token_id,
+	// key ("sk-..." + token key), and, when a plan was bound, plan_id,
+	// plan_title, plan_message.
 	data := gin.H{
 		"user_id":  target.Id,
 		"username": target.Username,
@@ -493,6 +496,9 @@ func provisionResponse(token *model.Token, target *model.User, planId int, planT
 // subscription plan and then creates an API key owned by that user, returning
 // the plaintext key once. Administrators use it to onboard accounts managed by
 // an external system that stores the New API user ID.
+//
+// Response data: user_id, username, token_id, key (plaintext "sk-...", returned
+// once), plan_id, plan_title, plan_message.
 func AdminProvisionUserToken(c *gin.Context) {
 	userId, err := strconv.Atoi(c.Param("id"))
 	if err != nil || userId <= 0 {
@@ -556,6 +562,10 @@ func resolveProvisionTarget(id int, username string) (*model.User, error) {
 // unique id, then optionally binds a plan and issues an API key in one call. The
 // caller may supply the primary key (user_id); otherwise external_id is used as
 // the username and the id is generated.
+//
+// Response data: user_id, username, token_id, key (plaintext "sk-...", returned
+// once), created (true when the user was just created), plan_id, plan_title,
+// plan_message.
 func AdminProvisionUser(c *gin.Context) {
 	var req provisionUserRequest
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
