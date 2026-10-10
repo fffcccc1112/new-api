@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 type tokenAutoGroupsInput struct {
@@ -353,6 +355,297 @@ func AddToken(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
+}
+
+type provisionUserTokenRequest struct {
+	PlanId         int    `json:"plan_id"`
+	TokenName      string `json:"token_name"`
+	UnlimitedQuota *bool  `json:"unlimited_quota"`
+	ExpiredTime    *int64 `json:"expired_time"`
+	RemainQuota    *int   `json:"remain_quota"`
+	Group          string `json:"group"`
+}
+
+// provisionUserRequest creates or reuses a user whose username is the external
+// system's own unique id, then optionally binds a plan and issues an API key.
+type provisionUserRequest struct {
+	Id          int    `json:"user_id"`
+	ExternalId  string `json:"external_id"`
+	Password    string `json:"password"`
+	DisplayName string `json:"display_name"`
+	Email       string `json:"email"`
+	provisionUserTokenRequest
+}
+
+// bindProvisionedPlan binds planId to the user when requested, writing the
+// shared payment-compliance and lookup errors. A zero planId is a no-op.
+func bindProvisionedPlan(c *gin.Context, userId, planId int) (title, message string, ok bool) {
+	if planId <= 0 {
+		return "", "", true
+	}
+	if !requirePaymentCompliance(c) {
+		return "", "", false
+	}
+	plan, err := model.GetSubscriptionPlanById(planId)
+	if err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return "", "", false
+	}
+	bindMessage, err := model.AdminBindSubscription(userId, planId, "")
+	if err != nil {
+		common.ApiError(c, err)
+		return "", "", false
+	}
+	if bindMessage != nil {
+		message = bindMessage.Error()
+	}
+	return plan.Title, message, true
+}
+
+// issueProvisionedToken validates the token options and creates one key owned
+// by target, writing the shared error contract on failure.
+func issueProvisionedToken(c *gin.Context, target *model.User, req provisionUserTokenRequest) (*model.Token, bool) {
+	name := strings.TrimSpace(req.TokenName)
+	if name == "" {
+		name = target.Username + " API"
+	}
+	if len(name) > 50 {
+		common.ApiErrorT(c, "Token name is too long")
+		return nil, false
+	}
+	unlimited := true
+	if req.UnlimitedQuota != nil {
+		unlimited = *req.UnlimitedQuota
+	}
+	remainQuota := 0
+	if req.RemainQuota != nil {
+		remainQuota = *req.RemainQuota
+	}
+	if !unlimited {
+		if remainQuota < 0 {
+			common.ApiErrorT(c, "Quota value cannot be negative")
+			return nil, false
+		}
+		if maxQuotaValue := maxTokenQuota(); remainQuota > maxQuotaValue {
+			common.ApiErrorT(c, "Quota value exceeds valid range, maximum is {{max}}", map[string]any{"max": logger.FormatQuota(maxQuotaValue)})
+			return nil, false
+		}
+	}
+	group := strings.TrimSpace(req.Group)
+	if group == "auto" {
+		common.ApiErrorT(c, "Invalid parameters")
+		return nil, false
+	}
+	maxTokens := operation_setting.GetMaxUserTokens()
+	count, err := model.CountUserTokens(target.Id)
+	if err != nil {
+		common.ApiError(c, err)
+		return nil, false
+	}
+	if int(count) >= maxTokens {
+		common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
+		return nil, false
+	}
+	expiredTime := int64(-1)
+	if req.ExpiredTime != nil {
+		expiredTime = *req.ExpiredTime
+	}
+	key, err := common.GenerateKey()
+	if err != nil {
+		common.ApiErrorT(c, "Failed to generate token")
+		common.SysLog("failed to generate token key: " + err.Error())
+		return nil, false
+	}
+	token := &model.Token{
+		UserId:         target.Id,
+		Name:           name,
+		Key:            key,
+		CreatedTime:    common.GetTimestamp(),
+		AccessedTime:   common.GetTimestamp(),
+		ExpiredTime:    expiredTime,
+		RemainQuota:    remainQuota,
+		UnlimitedQuota: unlimited,
+		Group:          group,
+	}
+	if err := token.Insert(); err != nil {
+		common.ApiError(c, err)
+		return nil, false
+	}
+	return token, true
+}
+
+func provisionResponse(token *model.Token, target *model.User, planId int, planTitle, planMessage string) gin.H {
+	data := gin.H{
+		"user_id":  target.Id,
+		"username": target.Username,
+		"token_id": token.Id,
+		"key":      "sk-" + token.Key,
+	}
+	if planId > 0 {
+		data["plan_id"] = planId
+		data["plan_title"] = planTitle
+		data["plan_message"] = planMessage
+	}
+	return data
+}
+
+// AdminProvisionUserToken provisions an existing user: it optionally binds a
+// subscription plan and then creates an API key owned by that user, returning
+// the plaintext key once. Administrators use it to onboard accounts managed by
+// an external system that stores the New API user ID.
+func AdminProvisionUserToken(c *gin.Context) {
+	userId, err := strconv.Atoi(c.Param("id"))
+	if err != nil || userId <= 0 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	var req provisionUserTokenRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	target, err := model.GetUserById(userId, false)
+	if err != nil {
+		common.ApiErrorT(c, "User does not exist")
+		return
+	}
+	if !canManageTargetRole(c.GetInt("role"), target.Role) {
+		common.ApiErrorT(c, "No permission to update users of same or higher permission level")
+		return
+	}
+	planTitle, planMessage, ok := bindProvisionedPlan(c, target.Id, req.PlanId)
+	if !ok {
+		return
+	}
+	token, ok := issueProvisionedToken(c, target, req)
+	if !ok {
+		return
+	}
+	auditParams := map[string]any{
+		"target_user_id": target.Id,
+		"username":       target.Username,
+		"token_id":       token.Id,
+		"token_name":     token.Name,
+	}
+	if req.PlanId > 0 {
+		auditParams["plan_id"] = req.PlanId
+		auditParams["plan_title"] = planTitle
+	}
+	recordManageAuditFor(c, target.Id, "user.provision", auditParams)
+	common.ApiSuccess(c, provisionResponse(token, target, req.PlanId, planTitle, planMessage))
+}
+
+// resolveProvisionTarget finds the user by explicit primary key when provided,
+// otherwise by username. A missing user returns (nil, nil).
+func resolveProvisionTarget(id int, username string) (*model.User, error) {
+	if id > 0 {
+		user, err := model.GetUserById(id, false)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return user, err
+	}
+	user, err := model.GetUserByUsername(username)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return user, err
+}
+
+// AdminProvisionUser creates or reuses a user keyed by the external system's
+// unique id, then optionally binds a plan and issues an API key in one call. The
+// caller may supply the primary key (user_id); otherwise external_id is used as
+// the username and the id is generated.
+func AdminProvisionUser(c *gin.Context) {
+	var req provisionUserRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	username := strings.TrimSpace(req.ExternalId)
+	if username == "" && req.Id > 0 {
+		username = strconv.Itoa(req.Id)
+	}
+	if username == "" || len(username) > 64 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+
+	created := false
+	target, err := resolveProvisionTarget(req.Id, username)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if target != nil {
+		if !canManageTargetRole(c.GetInt("role"), target.Role) {
+			common.ApiErrorT(c, "No permission to update users of same or higher permission level")
+			return
+		}
+	} else {
+		password := req.Password
+		if password == "" {
+			password = common.GetRandomString(24)
+		} else if len(password) < 8 || len(password) > 128 {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		displayName := strings.TrimSpace(req.DisplayName)
+		if displayName == "" {
+			displayName = username
+		}
+		if len(displayName) > 64 {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		email := model.NormalizeEmail(req.Email)
+		if email != "" && common.Validate.Var(email, "email,max=50") != nil {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		newUser := model.User{
+			Id:          req.Id,
+			Username:    username,
+			Password:    password,
+			DisplayName: displayName,
+			Email:       email,
+			Role:        common.RoleCommonUser,
+		}
+		if err := newUser.Insert(0); err != nil {
+			if errors.Is(err, model.ErrEmailAlreadyTaken) {
+				common.ApiErrorT(c, "Email address is already in use")
+				return
+			}
+			common.ApiError(c, err)
+			return
+		}
+		target = &newUser
+		created = true
+	}
+
+	planTitle, planMessage, ok := bindProvisionedPlan(c, target.Id, req.PlanId)
+	if !ok {
+		return
+	}
+	token, ok := issueProvisionedToken(c, target, req.provisionUserTokenRequest)
+	if !ok {
+		return
+	}
+	auditParams := map[string]any{
+		"target_user_id": target.Id,
+		"username":       target.Username,
+		"created":        created,
+		"token_id":       token.Id,
+		"token_name":     token.Name,
+	}
+	if req.PlanId > 0 {
+		auditParams["plan_id"] = req.PlanId
+		auditParams["plan_title"] = planTitle
+	}
+	recordManageAuditFor(c, target.Id, "user.provision", auditParams)
+	data := provisionResponse(token, target, req.PlanId, planTitle, planMessage)
+	data["created"] = created
+	common.ApiSuccess(c, data)
 }
 
 func DeleteToken(c *gin.Context) {

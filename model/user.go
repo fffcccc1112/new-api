@@ -504,6 +504,22 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	return users, total, nil
 }
 
+func GetUserByUsername(username string) (*User, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil, errors.New("username 为空！")
+	}
+	var user User
+	err := DB.Omit("password", "access_token").First(&user, "username = ?", username).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
 func GetUserById(id int, selectAll bool) (*User, error) {
 	if id == 0 {
 		return nil, common.NewMessage("ID is empty!")
@@ -673,6 +689,7 @@ func ensureEmailAvailableWithTx(tx *gorm.DB, email string, excludeUserID int) er
 }
 
 func (user *User) Insert(inviterId int) error {
+	explicitId := user.Id
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		return withNormalizedEmailLock(tx, user.Email, func(tx *gorm.DB) error {
 			if err := user.prepareForInsert(tx); err != nil {
@@ -688,7 +705,13 @@ func (user *User) Insert(inviterId int) error {
 				user.SetSetting(defaultSetting)
 			}
 
-			return tx.Create(user).Error
+			if err := tx.Create(user).Error; err != nil {
+				return err
+			}
+			if explicitId > 0 {
+				return realignUserIDSequence(tx)
+			}
+			return nil
 		})
 	}); err != nil {
 		return err
@@ -696,6 +719,16 @@ func (user *User) Insert(inviterId int) error {
 
 	user.finishInsert(inviterId)
 	return nil
+}
+
+// realignUserIDSequence advances the users id sequence after a row is inserted
+// with an operator-supplied primary key. PostgreSQL needs the explicit setval so
+// later auto-generated ids do not collide; MySQL and SQLite advance on their own.
+func realignUserIDSequence(tx *gorm.DB) error {
+	if !common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		return nil
+	}
+	return tx.Exec("SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(id) FROM users), 1))").Error
 }
 
 func (user *User) finishInsert(inviterId int) {
